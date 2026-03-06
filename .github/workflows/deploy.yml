@@ -174,13 +174,23 @@ jobs:
             --region ${{ env.AWS_REGION }} \
             --query 'Version' --output text --no-cli-pager)
           echo "Published version: $VERSION"
-          aws lambda update-alias \
+          # Cek apakah alias 'live' ada sebelum update (init-db tidak punya alias)
+          ALIAS_EXISTS=$(aws lambda get-alias \
             --function-name "$FUNC_NAME" \
             --name live \
-            --function-version "$VERSION" \
             --region ${{ env.AWS_REGION }} \
-            --no-cli-pager
-          echo "Alias 'live' updated to v$VERSION for $FUNC_NAME"
+            --query 'Name' --output text --no-cli-pager 2>/dev/null || echo "NOT_FOUND")
+          if [ "$ALIAS_EXISTS" = "live" ]; then
+            aws lambda update-alias \
+              --function-name "$FUNC_NAME" \
+              --name live \
+              --function-version "$VERSION" \
+              --region ${{ env.AWS_REGION }} \
+              --no-cli-pager
+            echo "Alias 'live' updated to v$VERSION for $FUNC_NAME"
+          else
+            echo "No alias 'live' for $FUNC_NAME - skipping alias update (code updated)"
+          fi
 
   # ─── JOB 4: Deploy order-management via CodeDeploy (Blue/Green)
   # Hanya fungsi utama ini yang pakai CodeDeploy Canary
@@ -278,6 +288,22 @@ jobs:
       - name: Create CodeDeploy deployment (Canary Blue/Green)
         id: codedeploy
         run: |
+          # Stop active deployment jika ada, agar tidak DeploymentLimitExceededException
+          ACTIVE=$(aws deploy list-deployments \
+            --application-name "$APP_NAME" \
+            --deployment-group-name "$DEPLOYMENT_GROUP" \
+            --include-only-statuses InProgress Created Ready \
+            --region ${{ env.AWS_REGION }} \
+            --query 'deployments[0]' --output text --no-cli-pager 2>/dev/null || echo "None")
+          if [ "$ACTIVE" != "None" ] && [ -n "$ACTIVE" ]; then
+            echo "Stopping active deployment: $ACTIVE"
+            aws deploy stop-deployment \
+              --deployment-id "$ACTIVE" \
+              --auto-rollback-enabled \
+              --region ${{ env.AWS_REGION }} \
+              --no-cli-pager || true
+            sleep 5
+          fi
           DEPLOYMENT_ID=$(aws deploy create-deployment \
             --application-name "$APP_NAME" \
             --deployment-group-name "$DEPLOYMENT_GROUP" \
