@@ -24,9 +24,8 @@ techno-juri/
     └── deploy.yml              ← GitHub Actions CI/CD (5 jobs)
 ```
 
+updare
 ---
-
-# 
 
 ## STEP 1 — Deploy Infrastruktur (Satu Script)
 

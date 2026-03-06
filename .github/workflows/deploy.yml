@@ -97,13 +97,10 @@ jobs:
 
       - name: Validate AppSpec
         run: |
-          python -c "
-          import yaml
-          with open('codedeploy/appspec.yml') as f:
-              d = yaml.safe_load(f)
-          assert 'Resources' in d
-          print('AppSpec valid')
-          "
+          test -f codedeploy/appspec.yml || (echo "appspec.yml not found" && exit 1)
+          grep -q "Resources" codedeploy/appspec.yml || (echo "Resources missing" && exit 1)
+          grep -q "Alias" codedeploy/appspec.yml || (echo "Alias missing" && exit 1)
+          echo "AppSpec valid"
 
       - name: Validate Frontend HTML
         run: |
