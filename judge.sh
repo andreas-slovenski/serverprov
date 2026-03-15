@@ -894,9 +894,21 @@ if ! skip_step 5; then
 
     if [ -n "$LAYER_ARN" ] && [ "$LAYER_ARN" != "None" ] && [ "$FORCE_LAYER" != "true" ]; then
         ok "Layer sudah ada, skip: $(echo $LAYER_ARN | awk -F: '{print $(NF-1)":"$NF}')"
-        warn "  Untuk rebuild: FORCE_LAYER=true ./judge.sh deploy $STUDENT_NAME $EMAIL 5"
+        warn "  psycopg2 error? Rebuild layer: FORCE_LAYER=true ./judge.sh deploy $STUDENT_NAME $EMAIL 5"
     else
-        [ "$FORCE_LAYER" = "true" ] && warn "FORCE_LAYER=true — rebuild layer..."
+        if [ "$FORCE_LAYER" = "true" ]; then
+            warn "FORCE_LAYER=true — hapus semua layer version lama dulu..."
+            _OLD_VERS=$(aws lambda list-layer-versions \
+                --layer-name "$LAYER_NAME" --region "$REGION" \
+                --query "LayerVersions[].Version" --output text 2>/dev/null || echo "")
+            for _V in $_OLD_VERS; do
+                aws lambda delete-layer-version \
+                    --layer-name "$LAYER_NAME" --version-number "$_V" \
+                    --region "$REGION" 2>/dev/null || true
+                log "  Deleted layer version: $_V"
+            done
+            LAYER_ARN=""
+        fi
         log "Building Lambda Layer dengan platform Linux x86_64..."
         LAYER_DIR="/tmp/techno_layer"
         rm -rf "$LAYER_DIR" && mkdir -p "${LAYER_DIR}/python"
@@ -1480,6 +1492,67 @@ if ! skip_step 9; then
             --function-name "$FUNC_NAME" --region "$REGION"
         ok "Lambda $FUNC_BASE deployed"
     done
+
+    # ── CodeDeploy Application + Deployment Group ───────────
+    log "Setting up CodeDeploy..."
+
+    # Create application (idempotent)
+    aws deploy create-application \
+        --application-name "techno-codedeploy-app" \
+        --compute-platform Lambda \
+        --region "$REGION" --no-cli-pager 2>/dev/null && \
+        log "  CodeDeploy app created: techno-codedeploy-app" || \
+        log "  CodeDeploy app sudah ada: techno-codedeploy-app"
+
+    # Create alias 'live' untuk order-management (wajib untuk Blue/Green)
+    log "  Creating Lambda alias 'live' untuk order-management..."
+    OM_VERSION=$(aws lambda publish-version \
+        --function-name "techno-lambda-order-management" \
+        --description "initial" \
+        --region "$REGION" --query Version --output text 2>/dev/null || echo "1")
+    aws lambda create-alias \
+        --function-name "techno-lambda-order-management" \
+        --name live \
+        --function-version "$OM_VERSION" \
+        --region "$REGION" --no-cli-pager 2>/dev/null || \
+    aws lambda update-alias \
+        --function-name "techno-lambda-order-management" \
+        --name live \
+        --function-version "$OM_VERSION" \
+        --region "$REGION" --no-cli-pager > /dev/null 2>&1 || true
+    log "  Alias 'live' → version $OM_VERSION"
+
+    # Create aliases 'live' untuk fungsi lain (deploy.yml cek alias ini)
+    for _FN in techno-lambda-process-payment techno-lambda-update-inventory \
+               techno-lambda-send-notification techno-lambda-generate-report \
+               techno-lambda-health-check; do
+        _VER=$(aws lambda publish-version \
+            --function-name "$_FN" --description "initial" \
+            --region "$REGION" --query Version --output text 2>/dev/null || echo "1")
+        aws lambda create-alias \
+            --function-name "$_FN" --name live \
+            --function-version "$_VER" \
+            --region "$REGION" --no-cli-pager 2>/dev/null || \
+        aws lambda update-alias \
+            --function-name "$_FN" --name live \
+            --function-version "$_VER" \
+            --region "$REGION" --no-cli-pager > /dev/null 2>&1 || true
+    done
+    ok "Lambda aliases 'live' ready"
+
+    # Create deployment group untuk order-management Blue/Green
+    log "  Creating CodeDeploy deployment group..."
+    aws deploy create-deployment-group \
+        --application-name "techno-codedeploy-app" \
+        --deployment-group-name "techno-codedeploy-group" \
+        --deployment-config-name "CodeDeployDefault.LambdaCanary10Percent5Minutes" \
+        --service-role-arn "$ROLE_ARN" \
+        --deployment-style "deploymentType=BLUE_GREEN,deploymentOption=WITH_TRAFFIC_CONTROL" \
+        --auto-rollback-configuration "enabled=true,events=DEPLOYMENT_FAILURE" \
+        --region "$REGION" --no-cli-pager 2>/dev/null && \
+        log "  Deployment group created: techno-codedeploy-group" || \
+        log "  Deployment group sudah ada: techno-codedeploy-group"
+    ok "CodeDeploy ready"
 
     # Upload deployment artifacts to S3
     if ls "${SCRIPT_DIR}/codedeploy/"* > /dev/null 2>&1; then
