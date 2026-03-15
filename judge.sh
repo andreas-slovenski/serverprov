@@ -808,17 +808,28 @@ if ! skip_step 3; then
             --description "RDS PostgreSQL - allow Lambda" \
             --vpc-id "$VPC_ID" \
             --region "$REGION" --query GroupId --output text)
+        # Allow dari Lambda SG (source group)
         aws ec2 authorize-security-group-ingress \
             --group-id "$SG_RDS" --protocol tcp --port 5432 --port 5432 \
             --source-group "$SG_LAMBDA" \
             --region "$REGION" --no-cli-pager > /dev/null 2>&1 || true
+        # Allow dari seluruh VPC CIDR (untuk init_db dan debugging)
         aws ec2 authorize-security-group-ingress \
             --group-id "$SG_RDS" --protocol tcp --port 5432 --port 5432 \
             --cidr 10.30.0.0/16 \
             --region "$REGION" --no-cli-pager > /dev/null 2>&1 || true
         log "  SG RDS created: $SG_RDS"
     else
-        log "  SG RDS exists: $SG_RDS"
+        # SG sudah ada — pastikan rules sudah benar (idempotent)
+        log "  SG RDS exists: $SG_RDS — verifying rules..."
+        aws ec2 authorize-security-group-ingress \
+            --group-id "$SG_RDS" --protocol tcp --port 5432 --port 5432 \
+            --cidr 10.30.0.0/16 \
+            --region "$REGION" --no-cli-pager > /dev/null 2>&1 || true
+        aws ec2 authorize-security-group-ingress \
+            --group-id "$SG_RDS" --protocol tcp --port 5432 --port 5432 \
+            --source-group "$SG_LAMBDA" \
+            --region "$REGION" --no-cli-pager > /dev/null 2>&1 || true
     fi
 
     # RDS Subnet Group
@@ -941,49 +952,37 @@ if ! skip_step 5; then
         --output text --region "$REGION")
 
     # ── Lambda Layer ──────────────────────────────────────
-    # Skip kalau sudah ada. Set FORCE_LAYER=true untuk rebuild.
-    FORCE_LAYER="${FORCE_LAYER:-false}"
-    LAYER_ARN=$(aws lambda list-layer-versions \
+    # ── Layer: SELALU hapus semua versi lama dulu, lalu rebuild ──
+    # Alasan: layer lama kemungkinan berisi psycopg2 binary Windows yang broken.
+    # Tidak ada cara tau apakah layer lama OK tanpa invoke — lebih aman rebuild.
+    log "Menghapus semua layer version lama (untuk pastikan psycopg2 bersih)..."
+    _OLD_VERS=$(aws lambda list-layer-versions \
         --layer-name "$LAYER_NAME" --region "$REGION" \
-        --query "LayerVersions[0].LayerVersionArn" \
-        --output text 2>/dev/null || echo "")
-
-    # Auto-detect apakah layer ada tapi psycopg2 broken
-    # Cek dengan invoke test kecil di Lambda health_check
-    if [ -n "$LAYER_ARN" ] && [ "$LAYER_ARN" != "None" ] && [ "$FORCE_LAYER" != "true" ]; then
-        log "  Verifikasi layer psycopg2 compatibility..."
-        _PSYCO_TEST=$(aws lambda invoke \
-            --function-name "techno-lambda-health-check" \
-            --payload '{"action":"test"}' \
-            --region "$REGION" \
-            --cli-binary-format raw-in-base64-out \
-            /tmp/_layer_test.json 2>&1 || echo "invoke_error")
-        _TEST_RESULT=$(cat /tmp/_layer_test.json 2>/dev/null || echo "")
-        if echo "$_TEST_RESULT" | grep -q "psycopg2\|ImportModuleError\|No module named"; then
-            warn "  Layer ada tapi psycopg2 BROKEN — force rebuild..."
-            FORCE_LAYER="true"
-        else
-            ok "Layer sudah ada dan OK, skip: $(echo $LAYER_ARN | awk -F: '{print $(NF-1)":"$NF}')"
-        fi
-    fi
-
-    if [ -n "$LAYER_ARN" ] && [ "$LAYER_ARN" != "None" ] && [ "$FORCE_LAYER" != "true" ]; then
-        ok "Layer skip (verified OK)"
-        warn "  Untuk force rebuild: FORCE_LAYER=true ./judge.sh deploy $STUDENT_NAME $EMAIL 5"
+        --query "LayerVersions[].Version" --output text 2>/dev/null | tr "\t" "\n" || echo "")
+    if [ -n "$_OLD_VERS" ] && [ "$_OLD_VERS" != "None" ]; then
+        for _V in $_OLD_VERS; do
+            [ -z "$_V" ] || [ "$_V" = "None" ] && continue
+            aws lambda delete-layer-version \
+                --layer-name "$LAYER_NAME" --version-number "$_V" \
+                --region "$REGION" 2>/dev/null && log "  Deleted layer v$_V" || true
+        done
+        # Juga hapus dari S3 jika ada
+        aws s3 rm "s3://${S3_DEPLOY}/layer/" --recursive --region "$REGION" 2>/dev/null || true
+        log "  Semua layer lama dihapus"
     else
-        if [ "$FORCE_LAYER" = "true" ]; then
-            warn "FORCE_LAYER=true — hapus semua layer version lama dulu..."
-            _OLD_VERS=$(aws lambda list-layer-versions \
-                --layer-name "$LAYER_NAME" --region "$REGION" \
-                --query "LayerVersions[].Version" --output text 2>/dev/null || echo "")
-            for _V in $_OLD_VERS; do
-                aws lambda delete-layer-version \
-                    --layer-name "$LAYER_NAME" --version-number "$_V" \
-                    --region "$REGION" 2>/dev/null || true
-                log "  Deleted layer version: $_V"
-            done
-            LAYER_ARN=""
+        log "  Tidak ada layer lama"
+    fi
+    LAYER_ARN=""
+
+    if true; then
+        # Pastikan Lambda SG punya egress ke port 5432 (RDS) dan 443 (AWS APIs)
+        if [ -n "$SG_LAMBDA" ] && [ "$SG_LAMBDA" != "None" ]; then
+            aws ec2 authorize-security-group-egress \
+                --group-id "$SG_LAMBDA" --protocol tcp --port 5432 --port 5432 \
+                --cidr 0.0.0.0/0 \
+                --region "$REGION" --no-cli-pager > /dev/null 2>&1 || true
         fi
+
         LAYER_DIR="/tmp/techno_layer"
         REQUIREMENTS_FILE="${SCRIPT_DIR}/lambda/requirements.txt"
         [ -f "$REQUIREMENTS_FILE" ] || err "requirements.txt tidak ditemukan di ${SCRIPT_DIR}/lambda/"
