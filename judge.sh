@@ -195,7 +195,7 @@ resolve_state() {
 # ================================================================
 write_verify_script() {
 cat > /tmp/techno_verify.py << 'PYEOF'
-import boto3, json, sys, urllib.request, time
+import boto3, json, sys, urllib.request, urllib.error, time
 
 student_name = sys.argv[1]
 account_id   = sys.argv[2]
@@ -354,14 +354,29 @@ chk("APIGateway","GET /orders lists orders",3, lambda: (
         http_get(f"{_ep}/orders", {"x-api-key": _key})
     )
 ))
-chk("APIGateway","API key required on protected routes",2, lambda: (
-    (_ for _ in ()).throw(Exception("no endpoint")) if not _ep else
-    (lambda: (
+# API key check: request TANPA key harus dapat 403 Forbidden
+# 403 = API key enforced = PASS
+def _check_api_key():
+    if not _ep:
+        raise Exception("no endpoint")
+    try:
+        # Request tanpa x-api-key header
         urllib.request.urlopen(
-            urllib.request.Request(f"{_ep}/orders", method="GET"), timeout=10
+            urllib.request.Request(f"{_ep}/orders", method="GET"),
+            timeout=10
         )
-    ) and "no key check")() or "key enforced"
-))
+        # Kalau 200 → API key NOT enforced → FAIL
+        raise Exception("API key NOT required — endpoint accessible without key!")
+    except urllib.error.HTTPError as e:
+        if e.code == 403:
+            return f"403 Forbidden ✓ (API key enforced)"
+        elif e.code == 401:
+            return f"401 Unauthorized ✓ (API key enforced)"
+        else:
+            raise Exception(f"Unexpected HTTP {e.code} (expect 403)")
+    except urllib.error.URLError as e:
+        raise Exception(f"Network error: {e}")
+chk("APIGateway","API key required on protected routes",2, _check_api_key)
 
 # ── SNS ───────────────────────────────────────────────────
 chk("SNS","Topic techno-notifications exists",2, lambda: (
@@ -1283,8 +1298,12 @@ if ! skip_step 6; then
       "Resource": "${ORDER_MGT_ARN}",
       "Parameters": {
         "action": "validate",
-        "order.\$": "\$"
+        "orderId.\$": "\$.orderId",
+        "customerId.\$": "\$.customerId",
+        "items.\$": "\$.items",
+        "totalAmount.\$": "\$.totalAmount"
       },
+      "ResultPath": "\$.validateResult",
       "Next": "ProcessPayment",
       "Retry": [{"ErrorEquals": ["Lambda.ServiceException","Lambda.TooManyRequestsException"],"IntervalSeconds": 2,"MaxAttempts": 3,"BackoffRate": 2}],
       "Catch": [{"ErrorEquals": ["States.ALL"],"Next": "OrderFailed","ResultPath": "\$.error"}]
@@ -1293,9 +1312,12 @@ if ! skip_step 6; then
       "Type": "Task",
       "Resource": "${PAYMENT_ARN}",
       "Parameters": {
-        "action": "process",
-        "order.\$": "\$"
+        "orderId.\$": "\$.orderId",
+        "customerId.\$": "\$.customerId",
+        "items.\$": "\$.items",
+        "totalAmount.\$": "\$.totalAmount"
       },
+      "ResultPath": "\$.paymentResult",
       "Next": "UpdateInventory",
       "Retry": [{"ErrorEquals": ["Lambda.ServiceException"],"IntervalSeconds": 2,"MaxAttempts": 2,"BackoffRate": 2}],
       "Catch": [{"ErrorEquals": ["States.ALL"],"Next": "PaymentFailed","ResultPath": "\$.error"}]
@@ -1304,9 +1326,11 @@ if ! skip_step 6; then
       "Type": "Task",
       "Resource": "${INVENTORY_ARN}",
       "Parameters": {
-        "action": "update",
-        "order.\$": "\$"
+        "orderId.\$": "\$.orderId",
+        "items.\$": "\$.items",
+        "totalAmount.\$": "\$.totalAmount"
       },
+      "ResultPath": "\$.inventoryResult",
       "Next": "SendConfirmation",
       "Retry": [{"ErrorEquals": ["Lambda.ServiceException"],"IntervalSeconds": 2,"MaxAttempts": 2,"BackoffRate": 2}],
       "Catch": [{"ErrorEquals": ["States.ALL"],"Next": "OrderFailed","ResultPath": "\$.error"}]
@@ -1315,25 +1339,33 @@ if ! skip_step 6; then
       "Type": "Task",
       "Resource": "${NOTIF_ARN}",
       "Parameters": {
-        "action": "send",
-        "type": "ORDER_CONFIRMED",
-        "order.\$": "\$"
+        "notificationType": "order_confirmation",
+        "data": {
+          "order_id.\$": "\$.orderId",
+          "customer_id.\$": "\$.customerId",
+          "total_amount.\$": "\$.totalAmount"
+        }
       },
+      "ResultPath": "\$.notificationResult",
       "Next": "OrderSuccess",
-      "Retry": [{"ErrorEquals": ["Lambda.ServiceException"],"IntervalSeconds": 2,"MaxAttempts": 2,"BackoffRate": 2}]
+      "Retry": [{"ErrorEquals": ["Lambda.ServiceException"],"IntervalSeconds": 2,"MaxAttempts": 2,"BackoffRate": 2}],
+      "Catch": [{"ErrorEquals": ["States.ALL"],"Next": "OrderFailed","ResultPath": "\$.error"}]
     },
-    "OrderSuccess": {
-      "Type": "Succeed"
-    },
+    "OrderSuccess": { "Type": "Succeed" },
     "PaymentFailed": {
       "Type": "Task",
       "Resource": "${NOTIF_ARN}",
       "Parameters": {
-        "action": "send",
-        "type": "PAYMENT_FAILED",
-        "order.\$": "\$"
+        "notificationType": "payment_failed",
+        "data": {
+          "order_id.\$": "\$.orderId",
+          "customer_id.\$": "\$.customerId",
+          "total_amount.\$": "\$.totalAmount"
+        }
       },
-      "Next": "OrderFailed"
+      "ResultPath": "\$.notificationResult",
+      "Next": "OrderFailed",
+      "Retry": [{"ErrorEquals": ["Lambda.ServiceException"],"IntervalSeconds": 2,"MaxAttempts": 2,"BackoffRate": 2}]
     },
     "OrderFailed": {
       "Type": "Fail",
@@ -1368,6 +1400,8 @@ SFEOF
         log "  Updated: $SF_NAME"
     fi
     ok "Step Functions: $SF_ARN"
+
+
 
     # Update Lambda env with SF_ARN
     for FUNC_BASE in order_management process_payment health_check; do
@@ -1544,25 +1578,49 @@ CORSJSON
         log "  CORS OPTIONS: $RID"
     }
 
-    # Build resource tree: /orders, /orders/{orderId}, /health
-    ORDERS_ID=$(ensure_resource "orders"     "$ROOT_ID")
-    ORDER_ITEM_ID=$(ensure_resource "{orderId}" "$ORDERS_ID")
-    HEALTH_ID=$(ensure_resource  "health"    "$ROOT_ID")
+    # ── Build full resource tree sesuai frontend API calls ──────────────
+    # Frontend pakai: /orders, /orders/{id}, /customers, /products,
+    #                 /health, /status/{id}, /workflows/stats
+    log "Creating API Gateway resources..."
 
-    # Methods
-    setup_method "$ORDERS_ID"     "GET"    "order_management" "true"
-    setup_method "$ORDERS_ID"     "POST"   "order_management" "true"
-    setup_method "$ORDER_ITEM_ID" "GET"    "order_management" "true"
-    setup_method "$ORDER_ITEM_ID" "PUT"    "order_management" "true"
-    setup_method "$ORDER_ITEM_ID" "DELETE" "order_management" "true"
-    setup_method "$HEALTH_ID"     "GET"    "health_check"     "false"
+    ORDERS_ID=$(ensure_resource    "orders"         "$ROOT_ID")
+    ORDER_ID=$(ensure_resource     "{orderId}"      "$ORDERS_ID")
+    CUSTOMERS_ID=$(ensure_resource "customers"      "$ROOT_ID")
+    CUSTOMER_ID=$(ensure_resource  "{customerId}"   "$CUSTOMERS_ID")
+    PRODUCTS_ID=$(ensure_resource  "products"       "$ROOT_ID")
+    PRODUCT_ID=$(ensure_resource   "{productId}"    "$PRODUCTS_ID")
+    HEALTH_ID=$(ensure_resource    "health"         "$ROOT_ID")
+    STATUS_ID=$(ensure_resource    "status"         "$ROOT_ID")
+    STATUS_ITEM_ID=$(ensure_resource "{executionId}" "$STATUS_ID")
+    WORKFLOWS_ID=$(ensure_resource "workflows"      "$ROOT_ID")
+    WF_STATS_ID=$(ensure_resource  "stats"          "$WORKFLOWS_ID")
 
-    # CORS — tambahkan OPTIONS ke semua resource
-    log "Configuring CORS untuk semua resource..."
-    setup_cors "$ORDERS_ID"     "GET,POST,OPTIONS"
-    setup_cors "$ORDER_ITEM_ID" "GET,PUT,DELETE,OPTIONS"
-    setup_cors "$HEALTH_ID"     "GET,OPTIONS"
-    ok "CORS configured"
+    # ── /orders ──────────────────────────────────────────────────────────
+    setup_method "$ORDERS_ID"   "GET"    "order_management" "true"
+    setup_method "$ORDERS_ID"   "POST"   "order_management" "true"
+    # ── /orders/{orderId} ────────────────────────────────────────────────
+    setup_method "$ORDER_ID"    "GET"    "order_management" "true"
+    setup_method "$ORDER_ID"    "PUT"    "order_management" "true"
+    setup_method "$ORDER_ID"    "DELETE" "order_management" "true"
+    # ── /customers ───────────────────────────────────────────────────────
+    setup_method "$CUSTOMERS_ID" "GET"  "order_management" "true"
+    setup_method "$CUSTOMER_ID"  "GET"  "order_management" "true"
+    # ── /products ────────────────────────────────────────────────────────
+    setup_method "$PRODUCTS_ID"  "GET"  "order_management" "true"
+    setup_method "$PRODUCT_ID"   "GET"  "order_management" "true"
+    # ── /health ──────────────────────────────────────────────────────────
+    setup_method "$HEALTH_ID"    "GET"  "health_check"     "false"
+    # ── /status/{executionId} ────────────────────────────────────────────
+    setup_method "$STATUS_ITEM_ID" "GET" "order_management" "true"
+    # ── /workflows/stats ─────────────────────────────────────────────────
+    setup_method "$WF_STATS_ID"  "GET"  "order_management" "true"
+
+    # ── CORS OPTIONS untuk semua resource ────────────────────────────────
+    log "Configuring CORS..."
+    for _RID in "$ORDERS_ID" "$ORDER_ID" "$CUSTOMERS_ID" "$CUSTOMER_ID"                 "$PRODUCTS_ID" "$PRODUCT_ID" "$HEALTH_ID"                 "$STATUS_ID" "$STATUS_ITEM_ID" "$WORKFLOWS_ID" "$WF_STATS_ID"; do
+        setup_cors "$_RID" "GET,POST,PUT,DELETE,OPTIONS"
+    done
+    ok "All routes + CORS configured"
 
     # Deploy
     aws apigateway create-deployment \
@@ -1675,7 +1733,73 @@ if ! skip_step 9; then
             continue
         fi
 
-        cp "$LAMBDA_FILE" "${TMP_PKG}/lambda_function.py"
+        # Patch order_management: tulis helper script ke file, lalu jalankan
+        if [ "$FUNC_BASE" = "order_management" ]; then
+            # Tulis patch script ke /tmp (hindari heredoc string literal issue)
+            cat > /tmp/patch_order_mgmt.py << 'PYEOF_PATCH'
+import sys
+
+src_file = sys.argv[1]
+dst_file = sys.argv[2]
+
+with open(src_file) as f:
+    src = f.read()
+
+WORKFLOW_FN = (
+    "\ndef get_workflow_stats():\n"
+    "    try:\n"
+    "        sf_arn = os.environ.get('STEP_FUNCTIONS_ARN', '')\n"
+    "        if not sf_arn:\n"
+    "            return response(200, {'total':0,'running':0,'succeeded':0,'failed':0,'executions':[]})\n"
+    "        execs = stepfunctions_client.list_executions(\n"
+    "            stateMachineArn=sf_arn, maxResults=20\n"
+    "        ).get('executions', [])\n"
+    "        stats = {'total':len(execs),'running':0,'succeeded':0,'failed':0}\n"
+    "        for e in execs:\n"
+    "            s = e.get('status','').lower()\n"
+    "            if s in stats: stats[s] += 1\n"
+    "        result = [{\n"
+    "            'executionArn': e['executionArn'],\n"
+    "            'name': e.get('name',''),\n"
+    "            'status': e.get('status',''),\n"
+    "            'startDate': e['startDate'].isoformat() if e.get('startDate') else None,\n"
+    "            'stopDate': e['stopDate'].isoformat() if e.get('stopDate') else None,\n"
+    "        } for e in execs]\n"
+    "        return response(200, {**stats, 'executions': result})\n"
+    "    except Exception as e:\n"
+    "        return response(200, {'total':0,'running':0,'succeeded':0,'failed':0,'executions':[]})\n"
+)
+
+ROUTE_HANDLER = (
+    "        # GET /workflows/stats\n"
+    "        if path == '/workflows/stats' and http_method == 'GET':\n"
+    "            return get_workflow_stats()\n\n"
+    "        return response(404, {'error': 'Route not found'})"
+)
+
+if '/workflows/stats' not in src:
+    src = src.replace(
+        "\ndef lambda_handler(event, context):",
+        WORKFLOW_FN + "\ndef lambda_handler(event, context):"
+    )
+    src = src.replace(
+        "        return response(404, {'error': 'Route not found'})",
+        ROUTE_HANDLER
+    )
+    print("  Patched: /workflows/stats added to order_management")
+else:
+    print("  /workflows/stats already present")
+
+with open(dst_file, 'w') as f:
+    f.write(src)
+PYEOF_PATCH
+
+            python3 /tmp/patch_order_mgmt.py \
+                "$LAMBDA_FILE" \
+                "${TMP_PKG}/lambda_function.py"
+        else
+            cp "$LAMBDA_FILE" "${TMP_PKG}/lambda_function.py"
+        fi
         (cd "$TMP_PKG" && zip -q "${FUNC_BASE}.zip" "lambda_function.py")
 
         aws lambda update-function-code \
