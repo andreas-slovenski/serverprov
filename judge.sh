@@ -274,22 +274,26 @@ chk("Storage",f"S3 reports bucket {P}-reports-{sn}-2026",2, lambda:
     s3.head_bucket(Bucket=f"{P}-reports-{sn}-2026") or "exists"
 )
 
-# ── DynamoDB ──────────────────────────────────────────────
-chk("DynamoDB","Table techno-orders ACTIVE",3, lambda: (
-    ddb.describe_table(TableName=f"{P}-orders")
-    ["Table"]["TableStatus"] == "ACTIVE" and "ACTIVE"
+# ── RDS ───────────────────────────────────────────────────
+rds_client = boto3.client("rds", region_name=region)
+chk("RDS","Instance techno-rds available",5, lambda: (
+    rds_client.describe_db_instances(DBInstanceIdentifier=f"{P}-rds")
+    ["DBInstances"][0]["DBInstanceStatus"] == "available" and "available"
 ))
-chk("DynamoDB","Table techno-inventory ACTIVE",2, lambda: (
-    ddb.describe_table(TableName=f"{P}-inventory")
-    ["Table"]["TableStatus"] == "ACTIVE" and "ACTIVE"
+chk("RDS","Secret techno/db/credentials exists",3, lambda: (
+    boto3.client("secretsmanager", region_name=region)
+    .describe_secret(SecretId=f"{P}/db/credentials")["Name"]
 ))
-chk("DynamoDB","Table techno-payments ACTIVE",2, lambda: (
-    ddb.describe_table(TableName=f"{P}-payments")
-    ["Table"]["TableStatus"] == "ACTIVE" and "ACTIVE"
-))
-chk("DynamoDB","TTL enabled on techno-orders",2, lambda: (
-    ddb.describe_time_to_live(TableName=f"{P}-orders")
-    ["TimeToLiveDescription"]["TimeToLiveStatus"] == "ENABLED" and "TTL enabled"
+chk("RDS","Lambda SECRET_ARN env var set",3, lambda: (
+    (lambda cfg: cfg.get("SECRET_ARN","") != "" and cfg["SECRET_ARN"])(
+        {v.split("=")[0]:v.split("=",1)[1] for v in
+         lmb.get_function_configuration(FunctionName="techno-lambda-health-check")
+         ["Environment"]["Variables"].items()
+         if isinstance(v, str)}
+    ) if False else (
+        lmb.get_function_configuration(FunctionName="techno-lambda-health-check")
+        ["Environment"]["Variables"].get("SECRET_ARN","") != "" and "SECRET_ARN set"
+    )
 ))
 
 # ── Lambda ────────────────────────────────────────────────
@@ -451,12 +455,15 @@ if [[ "$MODE" == "teardown" ]]; then
         --region "$REGION" 2>/dev/null && ok "Step Functions deleted" || \
         warn "Step Functions tidak ditemukan"
 
-    warn "Menghapus DynamoDB tables..."
-    for tbl in "${PROJECT}-orders" "${PROJECT}-inventory" "${PROJECT}-payments"; do
-        aws dynamodb delete-table --table-name "$tbl" \
-            --region "$REGION" 2>/dev/null && log "  Deleted: $tbl" || true
-    done
-    ok "DynamoDB deleted"
+    warn "Menghapus RDS instance..."
+    aws rds delete-db-instance \
+        --db-instance-identifier "${PROJECT}-rds" \
+        --skip-final-snapshot \
+        --region "$REGION" 2>/dev/null && ok "RDS deletion started" || warn "RDS tidak ditemukan"
+    aws secretsmanager delete-secret \
+        --secret-id "${PROJECT}/db/credentials" \
+        --force-delete-without-recovery \
+        --region "$REGION" 2>/dev/null && ok "DB Secret deleted" || true
 
     warn "Menghapus SNS topic..."
     _SNS=$(aws sns list-topics --region "$REGION" \
@@ -772,66 +779,111 @@ if ! skip_step 2; then
 
     ok "S3 buckets ready: $S3_DEPLOY, $S3_LOGS, $S3_REPORTS"
 fi
-
 # ================================================================
-#  STEP 3: Database (DynamoDB)
+#  STEP 3: Database (RDS PostgreSQL)
 # ================================================================
-section "STEP 3/11 — Database (DynamoDB Tables)"
+section "STEP 3/11 — Database (RDS PostgreSQL)"
 if ! skip_step 3; then
-    # Orders table
-    log "Creating DynamoDB table: ${PROJECT}-orders"
-    aws dynamodb create-table \
-        --table-name "${PROJECT}-orders" \
-        --attribute-definitions \
-            AttributeName=orderId,AttributeType=S \
-            AttributeName=customerId,AttributeType=S \
-        --key-schema \
-            AttributeName=orderId,KeyType=HASH \
-        --global-secondary-indexes '[{
-            "IndexName":"customerId-index",
-            "KeySchema":[{"AttributeName":"customerId","KeyType":"HASH"}],
-            "Projection":{"ProjectionType":"ALL"}
-        }]' \
-        --billing-mode PAY_PER_REQUEST \
-        --region "$REGION" --no-cli-pager > /dev/null 2>&1 || \
-    log "  Table ${PROJECT}-orders already exists"
-    aws dynamodb wait table-exists --table-name "${PROJECT}-orders" --region "$REGION"
-    aws dynamodb update-time-to-live \
-        --table-name "${PROJECT}-orders" \
-        --time-to-live-specification "Enabled=true,AttributeName=ttl" \
+    VPC_ID=$(aws cloudformation list-exports \
+        --query "Exports[?Name=='${PROJECT}-vpc-id'].Value" \
+        --output text --region "$REGION")
+    PRIV_SN1=$(aws cloudformation list-exports \
+        --query "Exports[?Name=='${PROJECT}-private-subnet-1'].Value" \
+        --output text --region "$REGION")
+    PRIV_SN2=$(aws cloudformation list-exports \
+        --query "Exports[?Name=='${PROJECT}-private-subnet-2'].Value" \
+        --output text --region "$REGION")
+    SG_LAMBDA=$(aws cloudformation list-exports \
+        --query "Exports[?Name=='${PROJECT}-sg-lambda-id'].Value" \
+        --output text --region "$REGION")
+
+    # Security group untuk RDS
+    log "Creating RDS security group..."
+    SG_RDS=$(aws ec2 describe-security-groups \
+        --filters "Name=group-name,Values=${PROJECT}-sg-rds" "Name=vpc-id,Values=${VPC_ID}" \
+        --query "SecurityGroups[0].GroupId" --output text --region "$REGION" 2>/dev/null || echo "")
+    if [ -z "$SG_RDS" ] || [ "$SG_RDS" = "None" ]; then
+        SG_RDS=$(aws ec2 create-security-group \
+            --group-name "${PROJECT}-sg-rds" \
+            --description "RDS PostgreSQL - allow Lambda" \
+            --vpc-id "$VPC_ID" \
+            --region "$REGION" --query GroupId --output text)
+        aws ec2 authorize-security-group-ingress \
+            --group-id "$SG_RDS" --protocol tcp --port 5432 --port 5432 \
+            --source-group "$SG_LAMBDA" \
+            --region "$REGION" --no-cli-pager > /dev/null 2>&1 || true
+        aws ec2 authorize-security-group-ingress \
+            --group-id "$SG_RDS" --protocol tcp --port 5432 --port 5432 \
+            --cidr 10.30.0.0/16 \
+            --region "$REGION" --no-cli-pager > /dev/null 2>&1 || true
+        log "  SG RDS created: $SG_RDS"
+    else
+        log "  SG RDS exists: $SG_RDS"
+    fi
+
+    # RDS Subnet Group
+    aws rds create-db-subnet-group \
+        --db-subnet-group-name "${PROJECT}-rds-subnet-group" \
+        --db-subnet-group-description "Techno OMS RDS" \
+        --subnet-ids "$PRIV_SN1" "$PRIV_SN2" \
         --region "$REGION" --no-cli-pager > /dev/null 2>&1 || true
 
-    # Inventory table
-    log "Creating DynamoDB table: ${PROJECT}-inventory"
-    aws dynamodb create-table \
-        --table-name "${PROJECT}-inventory" \
-        --attribute-definitions AttributeName=productId,AttributeType=S \
-        --key-schema AttributeName=productId,KeyType=HASH \
-        --billing-mode PAY_PER_REQUEST \
-        --region "$REGION" --no-cli-pager > /dev/null 2>&1 || \
-    log "  Table ${PROJECT}-inventory already exists"
-    aws dynamodb wait table-exists --table-name "${PROJECT}-inventory" --region "$REGION"
+    # Cek apakah RDS sudah ada
+    RDS_STATUS=$(aws rds describe-db-instances \
+        --db-instance-identifier "${PROJECT}-rds" \
+        --query "DBInstances[0].DBInstanceStatus" \
+        --output text --region "$REGION" 2>/dev/null || echo "NOT_FOUND")
 
-    # Payments table
-    log "Creating DynamoDB table: ${PROJECT}-payments"
-    aws dynamodb create-table \
-        --table-name "${PROJECT}-payments" \
-        --attribute-definitions \
-            AttributeName=paymentId,AttributeType=S \
-            AttributeName=orderId,AttributeType=S \
-        --key-schema AttributeName=paymentId,KeyType=HASH \
-        --global-secondary-indexes '[{
-            "IndexName":"orderId-index",
-            "KeySchema":[{"AttributeName":"orderId","KeyType":"HASH"}],
-            "Projection":{"ProjectionType":"ALL"}
-        }]' \
-        --billing-mode PAY_PER_REQUEST \
-        --region "$REGION" --no-cli-pager > /dev/null 2>&1 || \
-    log "  Table ${PROJECT}-payments already exists"
-    aws dynamodb wait table-exists --table-name "${PROJECT}-payments" --region "$REGION"
+    if [ "$RDS_STATUS" = "NOT_FOUND" ] || [ "$RDS_STATUS" = "None" ]; then
+        log "Creating RDS PostgreSQL db.t3.micro (~10 menit)..."
+        # Auto-detect versi postgres: pilih 15.x terbaru, fallback ke versi lain
+        ALL_PG=$(aws rds describe-db-engine-versions \
+            --engine postgres --output text \
+            --query "DBEngineVersions[].EngineVersion" \
+            --region "$REGION" 2>/dev/null | tr '\t' '\n' | sort -V)
+        PG_VERSION=$(echo "$ALL_PG" | grep "^15\." | tail -1)
+        [ -z "$PG_VERSION" ] && PG_VERSION=$(echo "$ALL_PG" | grep "^16\." | tail -1)
+        [ -z "$PG_VERSION" ] && PG_VERSION=$(echo "$ALL_PG" | grep "^14\." | tail -1)
+        [ -z "$PG_VERSION" ] && PG_VERSION=$(echo "$ALL_PG" | tail -1)
+        [ -z "$PG_VERSION" ] && PG_VERSION="15.7"
+        log "  PostgreSQL version: $PG_VERSION"
+        aws rds create-db-instance \
+            --db-instance-identifier "${PROJECT}-rds" \
+            --db-instance-class db.t3.micro \
+            --engine postgres \
+            --engine-version "$PG_VERSION" \
+            --master-username adminuser \
+            --master-user-password "TechnoOMS2026!" \
+            --db-name techno_db \
+            --allocated-storage 20 \
+            --storage-type gp2 \
+            --no-publicly-accessible \
+            --db-subnet-group-name "${PROJECT}-rds-subnet-group" \
+            --vpc-security-group-ids "$SG_RDS" \
+            --backup-retention-period 1 \
+            --no-multi-az \
+            --storage-encrypted \
+            --region "$REGION" --no-cli-pager > /dev/null
+    else
+        log "  RDS already exists: $RDS_STATUS"
+    fi
 
-    ok "DynamoDB tables ready"
+    log "Waiting for RDS available (max 15 menit)..."
+    aws rds wait db-instance-available \
+        --db-instance-identifier "${PROJECT}-rds" --region "$REGION"
+
+    RDS_ENDPOINT=$(aws rds describe-db-instances \
+        --db-instance-identifier "${PROJECT}-rds" \
+        --query "DBInstances[0].Endpoint.Address" \
+        --output text --region "$REGION")
+    ok "RDS ready: $RDS_ENDPOINT"
 fi
+
+# Resolve RDS endpoint untuk step berikutnya
+RDS_ENDPOINT=$(aws rds describe-db-instances \
+    --db-instance-identifier "${PROJECT}-rds" \
+    --query "DBInstances[0].Endpoint.Address" \
+    --output text --region "$REGION" 2>/dev/null || echo "")
 
 # ================================================================
 #  STEP 4: Secrets + SNS
@@ -852,16 +904,20 @@ if ! skip_step 4; then
     ok "SNS Topic: $SNS_TOPIC_ARN"
     warn "⚠  Cek inbox dan CONFIRM subscription email SNS!"
 
-    # Secrets Manager (DB/config placeholder)
-    aws secretsmanager create-secret \
-        --name "${PROJECT}/config" \
-        --secret-string "{\"sns_topic_arn\":\"${SNS_TOPIC_ARN}\",\"orders_table\":\"${PROJECT}-orders\",\"inventory_table\":\"${PROJECT}-inventory\",\"payments_table\":\"${PROJECT}-payments\",\"reports_bucket\":\"${S3_REPORTS}\",\"deploy_bucket\":\"${S3_DEPLOY}\"}" \
-        --region "$REGION" --query ARN --output text > /dev/null 2>&1 || \
+    # Secret format HARUS sesuai yang dibaca Lambda: host/dbname/username/password
+    SECRET_STRING="{\"host\":\"${RDS_ENDPOINT}\",\"dbname\":\"techno_db\",\"username\":\"adminuser\",\"password\":\"TechnoOMS2026!\",\"port\":5432}"
+    SECRET_ARN=$(aws secretsmanager create-secret \
+        --name "${PROJECT}/db/credentials" \
+        --secret-string "$SECRET_STRING" \
+        --region "$REGION" --query ARN --output text 2>/dev/null || \
     aws secretsmanager put-secret-value \
-        --secret-id "${PROJECT}/config" \
-        --secret-string "{\"sns_topic_arn\":\"${SNS_TOPIC_ARN}\",\"orders_table\":\"${PROJECT}-orders\",\"inventory_table\":\"${PROJECT}-inventory\",\"payments_table\":\"${PROJECT}-payments\",\"reports_bucket\":\"${S3_REPORTS}\",\"deploy_bucket\":\"${S3_DEPLOY}\"}" \
-        --region "$REGION" > /dev/null 2>&1 || true
-    ok "Secrets Manager ready"
+        --secret-id "${PROJECT}/db/credentials" \
+        --secret-string "$SECRET_STRING" \
+        --region "$REGION" --query ARN --output text 2>/dev/null || \
+    aws secretsmanager describe-secret \
+        --secret-id "${PROJECT}/db/credentials" \
+        --query ARN --output text --region "$REGION")
+    ok "Secret ARN: $SECRET_ARN"
 fi
 
 # Refresh SNS_TOPIC_ARN if skipped step 4
@@ -1037,7 +1093,11 @@ open('/tmp/techno_placeholder.zip','wb').write(buf.getvalue())
 "
 
     # Create/update Lambda functions — skip kalau sudah ada dan Active
-    ENV_COMMON="Variables={ORDERS_TABLE=${PROJECT}-orders,INVENTORY_TABLE=${PROJECT}-inventory,PAYMENTS_TABLE=${PROJECT}-payments,SNS_TOPIC_ARN=${SNS_TOPIC_ARN},REPORTS_BUCKET=${S3_REPORTS},DEPLOY_BUCKET=${S3_DEPLOY},STEP_FUNCTIONS_ARN=PLACEHOLDER,REGION=${REGION}}"
+    # Resolve SECRET_ARN fresh
+    SECRET_ARN=$(aws secretsmanager describe-secret \
+        --secret-id "${PROJECT}/db/credentials" \
+        --query ARN --output text --region "$REGION" 2>/dev/null || echo "")
+    ENV_COMMON="Variables={SECRET_ARN=${SECRET_ARN},SNS_TOPIC_ARN=${SNS_TOPIC_ARN},S3_ORDERS_BUCKET=${S3_REPORTS},S3_LOGS_BUCKET=${S3_LOGS},STEP_FUNCTIONS_ARN=PLACEHOLDER,REGION=${REGION},LOW_STOCK_THRESHOLD=5}"
 
     # Format: MEM:TIMEOUT:USE_VPC
     FUNC_ORDER_MAN="512:60:true"
@@ -1250,7 +1310,7 @@ SFEOF
         esac
         aws lambda update-function-configuration \
             --function-name "$FUNC_NAME" \
-            --environment "Variables={ORDERS_TABLE=${PROJECT}-orders,INVENTORY_TABLE=${PROJECT}-inventory,PAYMENTS_TABLE=${PROJECT}-payments,SNS_TOPIC_ARN=${SNS_TOPIC_ARN},REPORTS_BUCKET=${S3_REPORTS},DEPLOY_BUCKET=${S3_DEPLOY},STEP_FUNCTIONS_ARN=${SF_ARN},REGION=${REGION}}" \
+            --environment "Variables={ORDERS_TABLE=${PROJECT}-orders,INVENTORY_TABLE=${PROJECT}-inventory,PAYMENTS_TABLE=${PROJECT}-payments,SNS_TOPIC_ARN=${SNS_TOPIC_ARN},REPORTS_BUCKET=${S3_REPORTS},DEPLOY_BUCKET=${S3_DEPLOY},STEP_FUNCTIONS_ARN=${SF_ARN},REGION=${REGION},LOW_STOCK_THRESHOLD=5,S3_ORDERS_BUCKET=${S3_REPORTS},S3_LOGS_BUCKET=${S3_LOGS},SECRET_ARN=${SECRET_ARN}}" \
             --region "$REGION" --no-cli-pager > /dev/null 2>&1 || true
     done
     ok "Lambda env updated with Step Functions ARN"
