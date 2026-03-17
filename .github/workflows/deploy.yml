@@ -139,12 +139,6 @@ jobs:
           cd lambda/${{ matrix.function.dir }}
           zip -q /tmp/${FUNC_NAME}.zip lambda_function.py
 
-      - name: Upload zip to S3
-        run: |
-          aws s3 cp /tmp/${FUNC_NAME}.zip \
-            "s3://${{ secrets.S3_DEPLOYMENT_BUCKET }}/lambda/${FUNC_NAME}/${{ github.sha }}.zip" \
-            --region ${{ env.AWS_REGION }}
-
       - name: Update Lambda code
         run: |
           aws lambda update-function-code \
@@ -209,12 +203,6 @@ jobs:
           cd lambda/order_management
           zip -q /tmp/techno-lambda-order-management.zip lambda_function.py
           echo "Packaged order-management"
-
-      - name: Upload zip to S3
-        run: |
-          aws s3 cp /tmp/techno-lambda-order-management.zip \
-            "s3://${{ secrets.S3_DEPLOYMENT_BUCKET }}/lambda/techno-lambda-order-management/${{ github.sha }}.zip" \
-            --region ${{ env.AWS_REGION }}
 
       - name: Update Lambda code
         run: |
